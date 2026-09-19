@@ -1,0 +1,21 @@
+# 私钥与敏感信息
+DeepSeek_API_KEY.txt
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+
+# 测试数据
+test_books/
+tests/testdata/
+*.log
+crash.log
+
+# 临时
+.tmp/
+.DS_Store
+test_out.txt
+syn.txt
+
+# WorkBuddy 工作目录（含会话记忆，不进公开仓库）
+.workbuddy/

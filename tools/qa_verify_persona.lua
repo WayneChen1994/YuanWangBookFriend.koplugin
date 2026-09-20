@@ -152,6 +152,27 @@ local function dump(t)
     for _i, v in ipairs(t or {}) do out[#out + 1] = tostring(v) end
     return table.concat(out, " ｜ ")
 end
+-- 命中时把**那一行原文**带出来：第 5 节扫的是含注释的全文，
+-- 红的时候必须一眼看出红的是正文还是"注释里引用了旧文案"（工程师提的坑，
+-- 他差点在注释里写「写"AI 思考中"会让它听起来像中转站」而触发一次假红）。
+local function lineOf(src, sub)
+    if type(src) ~= "string" or type(sub) ~= "string" then return nil end
+    local pos = src:find(sub, 1, true)
+    if not pos then return nil end
+    local head, last = src:sub(1, pos), 0
+    local i = 1
+    while true do
+        local p = head:find("\n", i, true)
+        if not p then break end
+        last = p; i = p + 1
+    end
+    local e = src:find("\n", pos, true) or (#src + 1)
+    local line = src:sub(last + 1, e - 1)
+    if line:find("--", 1, true) then
+        return line .. "   ← 这行含 --，先确认是不是注释里引用了旧文案"
+    end
+    return line
+end
 
 -- ================= 0 前置：人设名从源码取，绝不写死 =================
 section("0. 前置：人设名只能从 Prompts.PERSONA_NAME 取")
@@ -159,12 +180,17 @@ local NAME = Prompts.PERSONA_NAME
 ok(type(NAME) == "string" and NAME ~= "",
     "0：（前置）Prompts.PERSONA_NAME 是个非空字符串（后面所有断言都以它为准，不写死字眼）",
     tostring(NAME))
--- 旧字面清单：这些是"看起来像中转站"的说法，改完之后一处都不该出现
+-- 旧字面清单：这些是"看起来像中转站"的说法，改完之后一处都不该出现。
+-- 括号里是**改之前**的行号（旧位置，只作索引，别拿它当现在的行号去对）；
+-- 改完之后它们分别落在：等待中 = Asker:thinkingText() 这一个共享出口
+-- （asker:250 与 chatdialog:246 都调它）、轻问提交 = asker:272、
+-- 回复就绪 = asker:301、请求失败 = asker:315。行号会随注释增删漂移，
+-- 所以断言一律按字面扫，不按行号。
 local OLD = {
-    "AI 思考中",      -- 等待中（asker:231 / chatdialog:245）
-    "已提交给 AI",    -- 轻问提交（asker:253）
-    "AI 回复已就绪",  -- 回复就绪（asker:282）
-    "AI 请求失败",    -- 请求失败（asker:295）
+    "AI 思考中",      -- 等待中（旧：asker:231 / chatdialog:245 → 现：thinkingText 共享出口）
+    "已提交给 AI",    -- 轻问提交（旧：asker:253 → 现：asker:272）
+    "AI 回复已就绪",  -- 回复就绪（旧：asker:282 → 现：asker:301）
+    "AI 请求失败",    -- 请求失败（旧：asker:295 → 现：asker:315）
 }
 -- 行为断言的统一口径：含人设名 + 不含任何旧字面
 local function checkPersona(s, what)
@@ -278,7 +304,13 @@ end
 -- ================= 5 静态兜底：旧字面一处不留 =================
 -- 行为断言只能覆盖我跑得到的那几条路径；源码里若还藏着一处没被我触发的旧字面，
 -- 静态扫描能把它兜出来（两条互补，不是二选一）。
-section("5. 静态兜底：该改的两个文件里一处旧字面都不留")
+--
+-- **这条扫的是含注释的全文，这是故意的**：放宽成"只扫代码"的话，
+-- 真有人把旧文案留在注释里、又恰好漏改正文，就查不出来了。
+-- 代价是：注释里引用旧文案也会红。所以红的时候会打印**命中那一行原文**
+-- （见 lineOf），一眼能分清红的是正文还是注释 —— 不再需要人肉排查。
+-- 同行的规矩：**注释里也不要引用旧文案**（工程师已认下这条，他差点踩到）。
+section("5. 静态兜底：该改的两个文件里一处旧字面都不留（含注释）")
 do
     local files = { "ui/asker.lua", "ui/chatdialog.lua" }
     for _i, rel in ipairs(files) do
@@ -288,7 +320,8 @@ do
             src and #src or nil)
         if type(src) == "string" then
             for _j, old in ipairs(OLD) do
-                ok(hasNot(src, old), "5：" .. rel .. " 里没有旧字面「" .. old .. "」")
+                ok(hasNot(src, old), "5：" .. rel .. " 里没有旧字面「" .. old .. "」",
+                    lineOf(src, old))
             end
         end
     end

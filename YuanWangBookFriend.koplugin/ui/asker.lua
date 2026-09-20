@@ -22,8 +22,27 @@ local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local _ = require("gettext")
+local T = require("ffi/util").template
 
 local Asker = {}
+
+--[[--
+等待类提示的统一出口（拟人化：主语是 %1，不是"AI"）。
+
+为什么写成方法而不是加载期的字符串常量：`_()` 的结果不能在模块加载时就固化，
+那时翻译目录可能还没装好，提前固化成原文会让后续切语言失效。
+和 ui/suggestpicker 的 thinkingText 是同一个写法。
+
+抽出来的理由很实际：深聊（ui/chatdialog）和即时提问（本文件）都要这句，
+两处各写一遍的话，改文案时必然改一处忘一处，用户就会在两块屏幕上看到
+两种叫法——那比不拟人更糟。
+
+为什么主语必须是 %1：这是用户唯一会长时间盯着看的文案。主语写成技术名词，
+整句听起来就只是个"中转站"；用户要的是"有个角色在跟我对话"这种感觉。
+--]]
+function Asker:thinkingText()
+    return T(_("%1思考中…"), Prompts.PERSONA_NAME)
+end
 
 --[[--
 注册"进度兜底来源"。
@@ -228,7 +247,7 @@ end
 function Asker:askAndShow(opts)
     local title = opts.title or _("远望书友")
     Trapper:wrap(function()
-        Trapper:info(_("AI 思考中…"))
+        Trapper:info(self:thinkingText())
         local content, err, from_cache, spoiler_hit = self:askSync(opts)
         if Trapper:isWrapped() then Trapper:clear() end
         if not content then
@@ -250,7 +269,7 @@ end
 function Asker:submitAsync(plugin, opts)
     local question = opts.question or ""
     logger.info("YWBF: submitAsync kind=", tostring(opts.kind), " sel_len=", #(opts.selected or ""))
-    self:notify(_("已提交给 AI，回复稍后送达"))
+    self:notify(T(_("已交给%1，回复稍后送达"), Prompts.PERSONA_NAME))
 
     -- Queue:process() 只把 fn 的第一个返回值传给 on_done，
     -- 防剧透命中标记用闭包变量带出去。
@@ -279,7 +298,7 @@ function Asker:submitAsync(plugin, opts)
                 spoiler_hit = spoiler_hit,
             }
             plugin.last_reply = reply
-            self:notify(_("AI 回复已就绪"))
+            self:notify(T(_("%1回复已就绪"), Prompts.PERSONA_NAME))
             -- 用户要求「快速查看，不用去菜单里找」：默认直接弹出结果卡片，
             -- 问题显示在回答上方。可在设置里关掉，退回只发通知、不打断阅读。
             if Config:get("light_auto_popup") then
@@ -292,7 +311,8 @@ function Asker:submitAsync(plugin, opts)
         end,
         on_error = function(err)
             logger.warn("YWBF: submitAsync failed:", tostring(err))
-            self:notify(_("AI 请求失败：") .. tostring(err))
+            -- 拟人化，但 err 必须照旧带出来：用户要拿它判断是网络、Key 还是余额的问题
+            self:notify(T(_("%1这边没能拿到回复："), Prompts.PERSONA_NAME) .. tostring(err))
         end,
     })
 

@@ -569,7 +569,7 @@ function SettingsUI:buildMenu(plugin)
     items[#items + 1] = {
         text = _("AI 回复风格"),
         help_text = T(_([[
-决定 AI 用什么样的语气说话，角色始终是“%1”。
+决定“%1”用什么样的语气说话——无论选哪一种，跟你对话的都是他。
 
 只影响表达方式，不影响事实边界：无论哪种风格，都仍受「只基于上下文回答」
 和防剧透约束的限制，两者冲突时以那些约束为准。]]), Prompts.PERSONA_NAME),
@@ -642,7 +642,7 @@ function SettingsUI:buildMenu(plugin)
 
     -- 「你可能想问」里的 AI 出题按钮（kind = ideas）
     items[#items + 1] = {
-        text = _("让 AI 帮我提问"),
+        text = T(_("让%1帮我提问"), Prompts.PERSONA_NAME),
         help_text = T(_([[开启（默认）：「你可能想问」里多一个「让%1来问（用一次额度）」按钮，
         点一下由 AI 针对你选中的那段文字现出几条问题。
 
@@ -659,7 +659,7 @@ function SettingsUI:buildMenu(plugin)
             local v = Config:get("ai_suggestions")
             Config:set("ai_suggestions", not v)
             UIManager:show(InfoMessage:new{
-                text = (not v) and _("「你可能想问」里会出现 AI 出题按钮")
+                text = (not v) and T(_("「你可能想问」里会出现「让%1来问」按钮"), Prompts.PERSONA_NAME)
                               or _("「你可能想问」只保留本地建议，不再消耗额度"),
             })
         end,

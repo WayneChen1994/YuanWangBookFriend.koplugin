@@ -242,7 +242,8 @@ function ChatDialog:open(plugin, opts)
         local idx = #turns
 
         Trapper:wrap(function()
-            Trapper:info(_("AI 思考中…"))
+            -- 与即时提问共用同一个出口（Asker:thinkingText），改文案只需改一处
+            Trapper:info(Asker:thinkingText())
             -- 每轮实时重取进度：对话期间用户可能已经翻页，用进入时的旧进度会误判
             local prog = Asker:fetchProgress() or opts.progress
             local content, err, from_cache, spoiler_hit = Asker:askSync({

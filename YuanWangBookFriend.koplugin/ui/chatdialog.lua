@@ -13,6 +13,7 @@
 
 local Asker = require("ui/asker")
 local Prompts = require("ywbf/prompts")
+local Store = require("ywbf/store")
 local SuggestPicker = require("ui/suggestpicker")
 local Util = require("ywbf/util")
 
@@ -197,41 +198,87 @@ function ChatDialog:open(plugin, opts)
         end
     end
 
-    -- 对话页：默认展示最新一轮，可切到完整对话；底部给「继续追问 / 结束」
+    -- 对话页：默认展示最新一轮，可切到完整对话；底部给「收藏 / 继续追问 / 结束」
+    --
+    -- 收藏只针对**最新一轮**（不管当前是在看最新一轮还是完整对话）：
+    -- 整段对话里每一轮都有自己的收藏按钮会把范围说不清楚——收藏的到底是这一轮、
+    -- 还是整段对话？用户在多轮里来回看时也会按错。一刀划到"最新一轮"最简单，
+    -- 语义也最清楚：屏幕上"当前在聊的这一轮"就是按钮作用的对象。
     local function showConversation(view_all)
         local n = #turns
+        local current = turns[n]
+        local ref = nil
+        if type(current) == "table" then
+            if type(current.stored) == "table" and current.stored.book_fp
+                and type(current.stored.index) == "number" then
+                ref = current.stored
+            elseif opts.book_fp and type(current.a) == "string" and current.a ~= "" then
+                -- 命中缓存的那一轮不会再写历史，用回答原文把之前那条找回来
+                local idx = Store:indexOfContent(opts.book_fp, current.a, "assistant")
+                if idx then ref = { book_fp = opts.book_fp, index = idx } end
+            end
+        end
+
         local viewer
+        local rows = {
+            {
+                {
+                    text = _("继续追问"),
+                    is_enter_default = true,
+                    callback = function()
+                        UIManager:close(viewer)
+                        askInput()
+                    end,
+                },
+                {
+                    text = view_all and _("只看最新一轮") or _("查看完整对话"),
+                    enabled = n > 1,
+                    callback = function()
+                        UIManager:close(viewer)
+                        showConversation(not view_all)
+                    end,
+                },
+            },
+        }
+
+        if ref then
+            rows[#rows + 1] = {
+                {
+                    id = Asker.FAVORITE_BUTTON_ID,
+                    text = Store:isFavorite(ref.book_fp, ref.index) and _("取消收藏") or _("收藏"),
+                    callback = function()
+                        local now = Store:setFavorite(ref.book_fp, ref.index,
+                            not Store:isFavorite(ref.book_fp, ref.index))
+                        if now == nil then
+                            Asker:notify(_("收藏没有生效：这一轮已经不在历史里了"))
+                            return
+                        end
+                        local btn = viewer and viewer.button_table
+                            and viewer.button_table:getButtonById(Asker.FAVORITE_BUTTON_ID)
+                        if btn and btn.setText then
+                            btn:setText(now and _("取消收藏") or _("收藏"))
+                        end
+                        -- 必须传 SOURCE_ALWAYS_SHOW，否则会被通知开关过滤掉、用户什么都看不到
+                        Asker:notify(now and _("已收藏这一轮，可在「我的收藏」里找到")
+                                         or _("已取消收藏这一轮"))
+                    end,
+                },
+            }
+        end
+
+        rows[#rows + 1] = {
+            {
+                text = _("结束"),
+                callback = function()
+                    UIManager:close(viewer)
+                end,
+            },
+        }
+
         viewer = TextViewer:new{
             title = T(_("远望书友-深聊（第 %1 轮）"), tostring(n)),
             text = view_all and renderAll() or renderLatest(),
-            buttons_table = {
-                {
-                    {
-                        text = _("继续追问"),
-                        is_enter_default = true,
-                        callback = function()
-                            UIManager:close(viewer)
-                            askInput()
-                        end,
-                    },
-                    {
-                        text = view_all and _("只看最新一轮") or _("查看完整对话"),
-                        enabled = n > 1,
-                        callback = function()
-                            UIManager:close(viewer)
-                            showConversation(not view_all)
-                        end,
-                    },
-                },
-                {
-                    {
-                        text = _("结束"),
-                        callback = function()
-                            UIManager:close(viewer)
-                        end,
-                    },
-                },
-            },
+            buttons_table = rows,
         }
         hardenAgainstSwipeClose(viewer)
         UIManager:show(viewer)
@@ -246,7 +293,7 @@ function ChatDialog:open(plugin, opts)
             Trapper:info(Asker:thinkingText())
             -- 每轮实时重取进度：对话期间用户可能已经翻页，用进入时的旧进度会误判
             local prog = Asker:fetchProgress() or opts.progress
-            local content, err, from_cache, spoiler_hit = Asker:askSync({
+            local content, err, from_cache, spoiler_hit, _truncated, stored = Asker:askSync({
                 kind = "chat",
                 title = _("远望书友-深聊"),
                 selected = selected_clean,
@@ -269,6 +316,8 @@ function ChatDialog:open(plugin, opts)
             end
 
             turns[idx].a = content
+            -- 这一轮在历史里的定位，供对话页挂收藏按钮
+            turns[idx].stored = stored
             if from_cache then
                 logger.info("YWBF: chat turn served from cache")
             end

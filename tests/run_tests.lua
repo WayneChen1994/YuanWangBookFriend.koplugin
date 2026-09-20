@@ -1012,7 +1012,8 @@ end  -- 合集 do-block
 
 print("=== spoiler: 管道无旁路 / 分层审查 ===")
 local ywbf_files = { "cache", "config", "context", "crypto", "deepseek", "httpclient",
-                     "prompts", "queue", "spoiler", "store", "tokens", "util" }
+                     "prompts", "queue", "spoiler", "store", "suggest", "tokens", "util",
+                     "export", "ota" }
 local ui_leak = 0
 for _, name in ipairs(ywbf_files) do
     local src = Config._read_file(PLUGIN_DIR .. "/ywbf/" .. name .. ".lua")
@@ -1021,13 +1022,74 @@ for _, name in ipairs(ywbf_files) do
     end
 end
 eq(ui_leak, 0, "ywbf/ 层无任何 KOReader UI 依赖")
-local ui_files = { "asker", "chatdialog", "settings", "toastcard" }
+local ui_files = { "asker", "chatdialog", "settings", "toastcard",
+                   "favorites", "suggestpicker" }
 local direct_post = 0
 for _, name in ipairs(ui_files) do
     local src = Config._read_file(PLUGIN_DIR .. "/ui/" .. name .. ".lua")
     if src and src:find("HttpClient", 1, true) then direct_post = direct_post + 1 end
 end
 eq(direct_post, 0, "ui/ 层不直接发 HTTP（必须经 DeepSeek:chat）")
+
+--[[--
+**清单漂移检测**（2026-09-20 补）。
+
+背景：这三处硬编码的文件清单**全都漂移过**，而且失效是**静默**的——
+新增 `ywbf/export.lua` / `ui/favorites.lua` 时没进 `ywbf_files` / `ui_files`，
+`ui/suggestpicker.lua` 更是从头到尾没进过任何清单。表现是 `eq(ui_leak, 0)`
+照样绿，因为它根本没扫那个文件：**防线还在，但已经不覆盖新代码了。**
+
+所以这里反向校验：用目录扫描拿到真实存在的文件，要求清单必须把它们都覆盖到。
+配套两条对照组（否则"空扫描"会让下面每条断言恒绿）：
+扫描必须真的扫到文件，且结果里含已知文件。
+--]]
+local function luaNamesIn(dir)
+    local names = {}
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not (ok_lfs and lfs and type(lfs.dir) == "function") then return nil end
+    for f in lfs.dir(dir) do
+        local n = f:match("^(.+)%.lua$")
+        if n then names[#names + 1] = n end
+    end
+    table.sort(names)
+    return names
+end
+
+local function hasName(list, want)
+    for _i, n in ipairs(list or {}) do if n == want then return true end end
+    return false
+end
+
+local function missingFrom(list, names)
+    local has = {}
+    for _i, n in ipairs(list or {}) do has[n] = true end
+    local missing = {}
+    for _j, n in ipairs(names or {}) do
+        if not has[n] then missing[#missing + 1] = n end
+    end
+    return missing
+end
+
+do
+    local ywbf_names = luaNamesIn(PLUGIN_DIR .. "/ywbf")
+    ok(type(ywbf_names) == "table" and #(ywbf_names or {}) > 0,
+        "扫到 ywbf/ 下的 .lua 文件（扫描本身可用，空扫描会让下条恒绿）")
+    if type(ywbf_names) == "table" and #ywbf_names > 0 then
+        ok(hasName(ywbf_names, "store"), "扫描结果里含已知文件 store.lua（对照）")
+        local miss = missingFrom(ywbf_files, ywbf_names)
+        eq(#miss, 0, "ywbf_files 覆盖了 ywbf/ 下每个 .lua（缺：" .. table.concat(miss, ",") .. "）")
+    end
+
+    local ui_names = luaNamesIn(PLUGIN_DIR .. "/ui")
+    ok(type(ui_names) == "table" and #(ui_names or {}) > 0,
+        "扫到 ui/ 下的 .lua 文件（扫描本身可用，空扫描会让下条恒绿）")
+    if type(ui_names) == "table" and #ui_names > 0 then
+        ok(hasName(ui_names, "asker"), "扫描结果里含已知文件 asker.lua（对照）")
+        local miss_ui = missingFrom(ui_files, ui_names)
+        eq(#miss_ui, 0, "ui_files 覆盖了 ui/ 下每个 .lua（缺：" .. table.concat(miss_ui, ",") .. "）")
+    end
+end
+
 local ds_src = Config._read_file(PLUGIN_DIR .. "/ywbf/deepseek.lua")
 ok(ds_src and ds_src:find("HttpClient.post", 1, true) ~= nil, "DeepSeek:chat 是唯一请求出口")
 ok(ds_src and ds_src:find("guardMessages", 1, true) ~= nil, "出口处有截断管道")
@@ -1129,8 +1191,10 @@ end
 local asker_src = Config._read_file(PLUGIN_DIR .. "/ui/asker.lua")
 ok(asker_src ~= nil, "能读到 ui/asker.lua 源码")
 if asker_src then
-    ok(asker_src:find("function Asker:showResult(title, content, extra_note, question)", 1, true) ~= nil,
-        "showResult 接受 question 参数")
+    -- 不锁结尾的括号：收藏与回顾阶段一给 showResult 追加了第 5 个参数 ref（收藏按钮定位用），
+    -- 锁到 ')' 会把"加了参数"误报成"丢了 question"。这条断言守的是 question 在不在。
+    ok(asker_src:find("function Asker:showResult(title, content, extra_note, question", 1, true) ~= nil,
+        "showResult 接受 question 参数（不锁参数个数）")
     ok(asker_src:find("你的问题", 1, true) ~= nil, "结果卡片里渲染「你的问题」")
     ok(asker_src:find("light_auto_popup", 1, true) ~= nil, "轻问回复弹出受 light_auto_popup 控制")
 end
@@ -1609,8 +1673,10 @@ settings.lua 里 `for _, b in ipairs(res.balances)` 把文件头的
 只有点到对应菜单项时才炸），所以在这里加一条静态护栏。
 --]]
 local GETTEXT_FILES = {
-    "main.lua", "ui/asker.lua", "ui/chatdialog.lua",
-    "ui/settings.lua", "ui/toastcard.lua", "ywbf/deepseek.lua",
+    "main.lua", "_meta.lua",
+    "ui/asker.lua", "ui/chatdialog.lua", "ui/favorites.lua",
+    "ui/settings.lua", "ui/suggestpicker.lua", "ui/toastcard.lua",
+    "ywbf/deepseek.lua", "ywbf/export.lua", "ywbf/ota.lua", "ywbf/suggest.lua",
 }
 for _gi, rel in ipairs(GETTEXT_FILES) do
     local src = Config._read_file(PLUGIN_DIR .. "/" .. rel)
@@ -1622,6 +1688,37 @@ for _gi, rel in ipairs(GETTEXT_FILES) do
         ok(src:find(", _ in ", 1, true) == nil,
             rel .. " 不用 (i, _) 作循环变量（会遮蔽 gettext）")
     end
+end
+
+--[[--
+GETTEXT_FILES 的漂移检测（同上，同一类故障的第二个实例）。
+
+`ui/favorites.lua` / `ywbf/export.lua` 新增时没进清单，`ui/suggestpicker.lua`
+更是从头到尾没进过——也就是说"加了新文件、护栅静默失效"这个故障**至少发生过两次**，
+只是前一次没人发现。这里反向校验：凡是源码里 `require("gettext")` 的文件，
+都必须在 GETTEXT_FILES 里。
+
+对照组：扫描必须真的扫到文件、且结果里含已知文件（`main.lua`），
+否则"空扫描"会让下面两条断言恒绿。
+--]]
+do
+    local rels = {}
+    local root_names = luaNamesIn(PLUGIN_DIR)
+    for _i, n in ipairs(root_names or {}) do rels[#rels + 1] = n .. ".lua" end
+    for _j, n in ipairs(luaNamesIn(PLUGIN_DIR .. "/ui") or {}) do rels[#rels + 1] = "ui/" .. n .. ".lua" end
+    for _k, n in ipairs(luaNamesIn(PLUGIN_DIR .. "/ywbf") or {}) do rels[#rels + 1] = "ywbf/" .. n .. ".lua" end
+
+    ok(#rels > 0, "扫到插件目录下的 .lua 文件（扫描本身可用，空扫描会让下条恒绿）")
+    ok(hasName(rels, "main.lua"), "扫描结果里含已知文件 main.lua（对照）")
+
+    local miss = {}
+    for _m, rel in ipairs(rels) do
+        local src = Config._read_file(PLUGIN_DIR .. "/" .. rel)
+        if src and src:find('require("gettext")', 1, true) and not hasName(GETTEXT_FILES, rel) then
+            miss[#miss + 1] = rel
+        end
+    end
+    eq(#miss, 0, "GETTEXT_FILES 覆盖了每个用 gettext 的 .lua（缺：" .. table.concat(miss, ",") .. "）")
 end
 
 print("=== HttpClient 白名单：只认 https ===")

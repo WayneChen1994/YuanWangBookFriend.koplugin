@@ -8,10 +8,13 @@ PRD 对应：F8.4（Key 加密存储）、F8.5（无遥测声明）、F4.1（防
 local Config = require("ywbf/config")
 local Crypto = require("ywbf/crypto")
 local DeepSeek = require("ywbf/deepseek")
+local Ota = require("ywbf/ota")
 local Prompts = require("ywbf/prompts")
 local Queue = require("ywbf/queue")
 local Spoiler = require("ywbf/spoiler")
 local Tokens = require("ywbf/tokens")
+
+local Favorites = require("ui/favorites")
 
 local ConfirmBox = require("ui/widget/confirmbox")
 local InfoMessage = require("ui/widget/infomessage")
@@ -118,12 +121,259 @@ function SettingsUI:importApiKeyFromFile()
     })
 end
 
+--[[--
+插件名与一句话说明：**读 `_meta.lua`，不在设置页里再抄一份**。
+
+抄一份的结果是菜单里的介绍和 KOReader 插件列表里的介绍各自演化，
+用户两处看到不一样的东西时，不知道该信哪个。
+`@module` 那个 require 偶尔会失败（比如某些加载顺序下），失败就用兜底文案，
+宁肯短一点也不回到写死两遍的老路。
+--]]
+local META_OK, PLUGIN_META = pcall(require, "_meta")
+local PLUGIN_FULLNAME = (META_OK and type(PLUGIN_META) == "table"
+    and type(PLUGIN_META.fullname) == "string" and PLUGIN_META.fullname) or _("远望书友")
+local PLUGIN_DESCRIPTION = (META_OK and type(PLUGIN_META) == "table"
+    and type(PLUGIN_META.description) == "string" and PLUGIN_META.description)
+    or _("KOReader 的 AI 辅助阅读插件。")
+
+--[[--
+「关于」子菜单：版本 / 数据目录 / 检查更新。
+
+版本号**必须取自 `Config.VERSION`**：它同时也是 OTA 用来判"有没有新版本"的那一个数。
+在这里写死第二份的话，用户看到"已是最新"却总也拿不到新版本就成了常态，
+而排查时会先怀疑网络、怀疑 GitHub，最后才想到是版本号写错了 —— 那份名单太贵。
+--]]
+function SettingsUI:buildAboutMenu()
+    local version_text = Config.VERSION
+    if type(version_text) ~= "string" or version_text == "" then
+        version_text = _("未知")
+    end
+
+    return {
+        {
+            text = PLUGIN_FULLNAME,
+            help_text = PLUGIN_DESCRIPTION,
+            keep_menu_open = true,
+        },
+        {
+            text = T(_("版本：%1"), version_text), -- luacheck: ignore
+            keep_menu_open = true,
+            callback = function()
+                UIManager:show(InfoMessage:new{
+                    text = T(_([[当前版本：%1
+
+版本号也是更新检查的基准。如果这个数字跟 Release 页面上的最新版本一致，
+说明你已经是最新的了。]]), version_text),
+                })
+            end,
+        },
+        {
+            text = T(_("数据目录：%1"), tostring(Config.paths.data or _("（未初始化）"))), -- luacheck: ignore
+            keep_menu_open = true,
+            callback = function()
+                UIManager:show(InfoMessage:new{
+                    text = T(_([[所有数据都在这个目录里：%1
+
+卸载插件时删掉这个目录就干净了；连上电脑也能直接从这里拷走：
+收藏导出的 Markdown 在其中的 export/ 下，更新备份在 ota_backup/ 下。]]),
+                        tostring(Config.paths.data or _("（未初始化）"))),
+                })
+            end,
+        },
+        {
+            text = _("检查更新"),
+            help_text = _([[向 GitHub 查询这个插件有没有新版本。
+查询只读取 Release 信息，不上传任何本机数据，也不消耗 API 额度。
+有新版本时会先给当前版本打一份备份，再下载铺进插件目录——你的 Key、收藏和历史都不会被动。]]),
+            keep_menu_open = true,
+            callback = function() SettingsUI:checkUpdate() end,
+        },
+    }
+end
+
+--[[--
+走一遍完整的手动更新：**备份 → 下载 → 铺装 → 提示重启**。
+
+为什么是全自动而不是"下载完让你自己去铺"：真机上让用户去 `tar` 解压，
+等于这个功能没有。所以整条链路都在这里，UI 只负责问一句"要不要装"。
+
+刻意不做的事：
+  · **不重启 KOReader**（用户明确要求）——装完只提示"请手动重启"；
+  · 任一步失败就把备份路径一起告诉用户，而不是只说"失败了"；
+  · 每一步都给一句短提示。沉默几秒钟在那个时刻看起来和"卡死了"没有区别。
+@param info table `Ota:checkForUpdate()` 的返回值
+--]]
+function SettingsUI:installUpdate(info)
+    local target = Config.paths.plugin
+    if type(target) ~= "string" or target == "" then
+        UIManager:show(InfoMessage:new{ text = _("插件目录没读到，没法更新。") })
+        return
+    end
+
+    --[[--
+    全程只留**一个**弹层。
+
+    原来这里是三个 `timeout = 1` 的短提示依次 show。问题是：备份、下载、安装是
+    **同步**执行的，主循环被堵住时它们根本来不及绘制，等循环转过来就变成好几层
+    摞在一起（还都带着 1 秒后自动消失的计时）。改成复用同一个弹层：换文案时
+    先 close 再 show，出结果时同样先 close——屏幕上任何时刻只有一个。
+    --]]
+    local stage = nil
+    local function say(text)
+        if stage then UIManager:close(stage) end
+        stage = InfoMessage:new{ text = text }
+        UIManager:show(stage)
+    end
+    local function finish(text)
+        if stage then UIManager:close(stage); stage = nil end
+        UIManager:show(InfoMessage:new{ text = text })
+    end
+
+    say(T(_("%1正在备份当前版本…"), Prompts.PERSONA_NAME)) -- luacheck: ignore
+    local backup_path, err = Ota:backup(target)
+    if not backup_path then
+        finish(T(_("备份失败，已停止更新：%1"), tostring(err)))
+        return
+    end
+
+    local zip_path = target .. "/data/" .. string.format("update-%s.zip",
+        os.date("%Y%m%d-%H%M%S") or tostring(os.time()))
+    say(T(_("%1正在下载新版本…"), Prompts.PERSONA_NAME)) -- luacheck: ignore
+    local ok_dl, err_dl = Ota:download(info and info.url or nil, zip_path)
+    if not ok_dl then
+        finish(T(_("下载失败，当前版本没有被改动：%1"), tostring(err_dl)))
+        return
+    end
+
+    say(T(_("%1正在安装…"), Prompts.PERSONA_NAME)) -- luacheck: ignore
+    local ok_apply, err_apply = Ota:apply(zip_path, target)
+    if not ok_apply then
+        finish(T(_([[安装失败：%1
+
+当前版本没有被改动。如果想回到安装前的样子，把这份备份里的文件盖回去即可：
+%2]]), tostring(err_apply), tostring(backup_path)))
+        return
+    end
+
+    -- 落盘成功就把压缩包删掉：它可能有好几 MB，没必要长期占着插件目录
+    os.remove(zip_path)
+
+    finish(T(_([[更新完成：%1 → %2
+
+请手动重启 KOReader 让新版本生效（插件不会自己去重启你的阅读器）。
+
+当前版本的备份在：%3
+新版本有问题的话，把备份里的文件盖回去即可。]]),
+            tostring(info and info.current or _("未知")),
+            tostring(info and info.latest or _("未知")),
+            tostring(backup_path)))
+end
+
+--[[--
+查有没有新版本（走 Queue，和"测试连接"同一套异步写法）。
+
+三种结果都要说清楚：
+  · 有新版本 → 二次确认再装（下载安装是有副作用的动作，不该一个误触就跑起来）；
+  · 已是最新 → 明确告诉他"这就是最新的了"，而不是什么都不说；
+  · 查不到 → 把原因说出来（没网 / GitHub 没发布过 / 内容解析不出来），
+    绝不静默——静默的话用户只会以为"检查过了，没有"，而真相可能是根本没查成功。
+--]]
+function SettingsUI:checkUpdate()
+    --[[--
+    进度提示**不能带 timeout**。
+
+    下面这一步是 `Queue:submit` 的异步网络查询，真机上要跑好几秒。
+    `timeout = 1` 的话那句话 1 秒就自己消失了，之后屏幕上什么都没有，
+    直到结果窗口突然蹦出来——用户看到的实际效果是"点了没反应，隔半天才响一下"。
+    所以让它常驻到结果回来为止，回来时**先 close 再 show 结果**：
+    任何时刻手上一个弹层，既不叠层，也不会中途失联。
+    --]]
+    local progress = InfoMessage:new{
+        text = T(_("%1正在检查更新…"), Prompts.PERSONA_NAME), -- luacheck: ignore
+    }
+    UIManager:show(progress)
+
+    -- 结果窗口统一从这里出去：先收掉进度提示，再显示结果
+    local function finish(widget)
+        UIManager:close(progress)
+        UIManager:show(widget)
+    end
+
+    Queue:submit({
+        name = "check_update",
+        retries = 1,
+        fn = function()
+            local info, err = Ota:checkForUpdate()
+            if not info then return nil, err end
+            return info
+        end,
+        on_done = function(info)
+            if type(info) ~= "table" then
+                -- 走到这里说明 fn 既没给结果也没抛错，静默等于让人以为"查过了，没有"
+                finish(InfoMessage:new{ text = _("没有查到更新信息。") })
+                return
+            end
+            if not info.available then
+                finish(InfoMessage:new{
+                    text = T(_([[已经是最新版本了。
+
+当前版本：%1
+GitHub 最新：%2]]), tostring(info.current), tostring(info.latest)),
+                })
+                return
+            end
+            -- 更新说明可能很长，先收短：确认框不是读长篇 Markdown 的地方。
+            -- 完整的说明在 Release 页面上，地址一并给用户（他想细看时得有地方去）。
+            local notes = type(info.notes) == "string" and info.notes or ""
+            if #notes > 200 then
+                notes = notes:sub(1, 200) .. "…"
+            end
+            local release_url = type(info.html_url) == "string" and info.html_url or ""
+            finish(ConfirmBox:new{
+                text = T(_([[发现新版本：%1 → %2
+
+%3
+
+更新说明：
+%4
+
+Release 页面：%5
+
+会先给现在的版本打个备份，再下载安装。装完请手动重启 KOReader。]]),
+                    tostring(info.current), tostring(info.latest),
+                    tostring(info.name or ""), notes, release_url),
+                ok_text = _("下载并安装"),
+                cancel_text = _("以后再说"),
+                ok_callback = function() SettingsUI:installUpdate(info) end,
+            })
+        end,
+        on_error = function(err)
+            finish(InfoMessage:new{
+                text = T(_("没有查到更新信息：%1"), tostring(err)),
+            })
+        end,
+    })
+    Queue:process()
+end
+
 function SettingsUI:testConnection()
     if not DeepSeek:hasApiKey() then
         UIManager:show(InfoMessage:new{ text = _("请先配置 API Key") })
         return
     end
-    UIManager:show(InfoMessage:new{ text = _("正在测试连接…"), timeout = 1 })
+    --[[--
+    与 `checkUpdate` 同一套写法：进度提示**不带 timeout**（这里要打一次真请求，几秒起步，
+    `timeout = 1` 的提示 1 秒就消失，用户看到的是"点了没反应"）；结果出来前**先 close
+    进度提示再 show**，任何时刻手上一个弹层。文案统一走「小望」，不写中性措辞。
+    --]]
+    local progress = InfoMessage:new{
+        text = T(_("%1正在测试连接…"), Prompts.PERSONA_NAME), -- luacheck: ignore
+    }
+    UIManager:show(progress)
+    local function finish(widget)
+        UIManager:close(progress)
+        UIManager:show(widget)
+    end
 
     Queue:submit({
         name = "test_connection",
@@ -134,13 +384,15 @@ function SettingsUI:testConnection()
             }, { max_tokens = 128, temperature = 0.3 })
         end,
         on_done = function(result)
-            UIManager:show(InfoMessage:new{
+            -- result 可能是 nil（fn 既没返回也没抛错），直接取字段会崩
+            local r = type(result) == "table" and result or {}
+            finish(InfoMessage:new{
                 text = T(_("连接成功\n\n模型回复：%1\n\n本次消耗：%2 tokens"),
-                    result.content or "", tostring((result.usage or {}).total_tokens or "?")),
+                    r.content or "", tostring((r.usage or {}).total_tokens or "?")),
             })
         end,
         on_error = function(err)
-            UIManager:show(InfoMessage:new{ text = _("连接失败：") .. tostring(err) })
+            finish(InfoMessage:new{ text = _("连接失败：") .. tostring(err) })
         end,
     })
     Queue:process()
@@ -205,17 +457,25 @@ function SettingsUI:queryBalance()
         UIManager:show(InfoMessage:new{ text = _("请先配置 API Key") })
         return
     end
-    UIManager:show(InfoMessage:new{ text = _("正在查询余额…"), timeout = 1 })
+    -- 同上：进度提示不带 timeout，结果先关再弹，文案走「小望」
+    local progress = InfoMessage:new{
+        text = T(_("%1正在查询余额…"), Prompts.PERSONA_NAME), -- luacheck: ignore
+    }
+    UIManager:show(progress)
+    local function finish(widget)
+        UIManager:close(progress)
+        UIManager:show(widget)
+    end
 
     Queue:submit({
         name = "balance",
         retries = 0,
         fn = function() return DeepSeek:balance() end,
         on_done = function(res)
-            UIManager:show(InfoMessage:new{ text = SettingsUI.formatBalance(res) })
+            finish(InfoMessage:new{ text = SettingsUI.formatBalance(res) })
         end,
         on_error = function(err)
-            UIManager:show(InfoMessage:new{
+            finish(InfoMessage:new{
                 text = _("余额查询失败：") .. tostring(err),
             })
         end,
@@ -508,6 +768,59 @@ function SettingsUI:buildReplyStyleMenu()
     return subs
 end
 
+--[[--
+「我的收藏」子菜单。
+
+五个入口各自的范围都写在标题里（本书 / 全部 / 搜索 / 导出本书 / 导出全部），
+因为"收藏在哪儿"这件事用户最容易记混：收藏跟着书走，不在一本书里。
+
+导出为什么放在这里而不是另起一级菜单：导出是"把收藏带走"的动作，
+跟"看收藏"是同一件事的后半段——用户想起来要导出的时候，一定是在看收藏的时候。
+--]]
+function SettingsUI:buildFavoritesMenu(plugin)
+    local function currentBookFp()
+        if plugin and plugin.bookFingerprint then return plugin:bookFingerprint() end
+        return nil
+    end
+    local function currentBookTitle()
+        if plugin and plugin.bookTitle then return plugin:bookTitle() end
+        return nil
+    end
+    return {
+        {
+            text = _("本书收藏"),
+            keep_menu_open = true,
+            callback = function()
+                Favorites:showBookFavorites(currentBookFp(), currentBookTitle())
+            end,
+        },
+        {
+            text = _("全部收藏"),
+            help_text = _("按书名分组，组内按时间倒序。收藏跟着书走，不在一本书里。"),
+            keep_menu_open = true,
+            callback = function() Favorites:showAllFavorites() end,
+        },
+        {
+            text = _("搜索收藏与历史"),
+            help_text = _("在所有书里搜索：命中提问、引用的段落，以及小望的回复。"),
+            keep_menu_open = true,
+            callback = function() Favorites:askSearch(nil) end,
+        },
+        {
+            text = _("导出 Markdown（本书）"),
+            help_text = _("把这本书的收藏写成 Markdown，文件落在插件目录里，连上电脑拷走。"),
+            keep_menu_open = true,
+            callback = function() Favorites:exportBook(currentBookFp()) end,
+        },
+        {
+            text = _("导出 Markdown（全部）"),
+            help_text = _("把所有书收藏写成一个文件，按书分组。文件名里带导出时间，不会互相覆盖。"),
+            keep_menu_open = true,
+            callback = function() Favorites:exportAll() end,
+        },
+    }
+end
+
 function SettingsUI:buildMenu(plugin)
     local items = {}
 
@@ -591,6 +904,12 @@ function SettingsUI:buildMenu(plugin)
             return T(_("防剧透模式（%1 · %2）"), on and _("已开启") or _("已关闭"), gname) -- luacheck: ignore
         end,
         sub_item_table = SettingsUI:buildSpoilerMenu(plugin),
+    }
+
+    -- 收藏与回顾（阶段一：列表 + 关键词检索）
+    items[#items + 1] = {
+        text = _("我的收藏"),
+        sub_item_table = SettingsUI:buildFavoritesMenu(plugin),
     }
 
     -- 轻问的异步回复入口
@@ -697,6 +1016,16 @@ function SettingsUI:buildMenu(plugin)
 · 插件无任何使用统计上报]]), tostring(Config.paths.data)),
             })
         end,
+    }
+
+    items[#items + 1] = {
+        text = _("关于远望书友"),
+        keep_menu_open = true,
+        text_func = function()
+            local v = Config.VERSION
+            return T(_("关于远望书友（v%1）"), (type(v) == "string" and v) or _("未知")) -- luacheck: ignore
+        end,
+        sub_item_table = SettingsUI:buildAboutMenu(),
     }
 
     items[#items + 1] = {

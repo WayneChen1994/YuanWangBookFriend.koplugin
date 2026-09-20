@@ -92,6 +92,51 @@ function YuanWangBookFriend:pageText(highlight)
     return txt
 end
 
+--[[--
+当前书名（只给展示和收藏列表用）。
+
+两级取法，都做了 pcall：
+  · 文档元数据里的 title（epub 的 dc:title，最准）；
+  · 取不到就用文件名（去目录、去扩展名）——PDF 和元数据缺失的 epub 靠它。
+
+拿不到就返回 nil，由 Store 侧回退显示"未知书"。
+绝不在 ywbf/ 纯逻辑层里摸 UI：这里取到的是字符串，传下去的也是字符串。
+--]]
+function YuanWangBookFriend:bookTitle()
+    local doc = self.ui and self.ui.document
+    if doc and doc.getProps then
+        local ok, props = pcall(doc.getProps, doc)
+        if ok and type(props) == "table" and type(props.title) == "string" and props.title ~= "" then
+            return props.title
+        end
+    end
+    local path = doc and doc.file
+    if type(path) == "string" and path ~= "" then
+        local name = path:match("([^/\\]+)$") or path
+        name = name:gsub("%.[^./\\]+$", "")
+        if name ~= "" then return name end
+    end
+    return nil
+end
+
+--[[--
+把"当前这本书叫什么"记进书名索引。
+
+为什么要在打开书时单独记一次：跨书收藏列表要按书名分组，而书名索引的兜底来源
+是"写入历史时顺带写"（ywbf/store.lua 的 append）。一本刚打开、还没有任何问答的书
+根本不会走到那里，跨书列表里就找不到它的名字。
+只在 onReaderReady 里调（每本书一次），不放 gather：gather 每次长按都会跑，
+没必要为了一条没变的信息反复写文件。
+--]]
+function YuanWangBookFriend:noteCurrentBook()
+    local fp = self:bookFingerprint()
+    local title = self:bookTitle()
+    if fp and title then
+        Store:noteBook(fp, title)
+        logger.info("YWBF: book noted, title =", tostring(title))
+    end
+end
+
 function YuanWangBookFriend:selectionOf(highlight)
     local sel = ""
     if highlight and highlight.selected_text and highlight.selected_text.text then
@@ -122,6 +167,9 @@ function YuanWangBookFriend:gather(highlight)
         selected = selected,
         page_text = self:pageText(highlight),
         book_fp = self:bookFingerprint(),
+        -- 书名一路传到 askSync，落进历史条目（收藏列表要按它分组）。
+        -- 传的是字符串，不是 document 之类的 UI 对象——纯逻辑层不许摸 UI。
+        book_title = self:bookTitle(),
         progress = self:progress(),
     }
 end
@@ -202,6 +250,8 @@ end
 function YuanWangBookFriend:onReaderReady()
     -- 文档就绪后再注册长按菜单（部分设备上 init 时 highlight 模块还没建好）
     self:registerHighlightButtons()
+    -- 记一次书名：跨书收藏列表靠它显示书名（见 noteCurrentBook 的说明）
+    self:noteCurrentBook()
 end
 
 function YuanWangBookFriend:onDispatcherRegisterActions()
@@ -234,13 +284,34 @@ function YuanWangBookFriend:currentProgress()
     return self:progress()
 end
 
--- 供设置菜单展示轻问的异步回复
+--[[--
+供设置菜单展示轻问的异步回复。
+
+原来的实现只读 `self.last_reply`（纯内存字段），于是"关掉书再进来就是空的"——
+而真实的问答一直躺在 data/history/<fp>.json 里，只是没接过来。
+现在内存里没有时回退去历史里读当前书最后一条回答：关书、重启都能看到，
+这才是用户以为自己在用的功能。
+
+跨书读不到（当前书本来就没有历史）时才维持原来的空提示。
+--]]
 function YuanWangBookFriend:showLastReply()
-    if not self.last_reply or Util.isEmpty(self.last_reply.content) then
+    local reply = self.last_reply
+    if reply and not Util.isEmpty(reply.content) then
+        local ref = (reply.book_fp and reply.index)
+            and { book_fp = reply.book_fp, index = reply.index } or nil
+        Asker:showResult(reply.title or _("轻问回复"), reply.content, nil, reply.question, ref)
+        return
+    end
+
+    local idx, row = Store:lastAssistant(self:bookFingerprint())
+    if not row or Util.isEmpty(row.content) then
         UIManager:show(InfoMessage:new{ text = _("还没有异步回复。用「轻问」提交问题后会在这里看到结果。") })
         return
     end
-    Asker:showResult(self.last_reply.title or _("轻问回复"), self.last_reply.content)
+    local note = _("（来自历史记录）")
+    Asker:showResult(row.kind == "light" and _("轻问回复") or _("远望书友"),
+        row.content, note, Store:questionFor(row.book_fp, idx),
+        { book_fp = row.book_fp, index = idx })
 end
 
 -- 供其它模块（后续 UI）复用的简短入口

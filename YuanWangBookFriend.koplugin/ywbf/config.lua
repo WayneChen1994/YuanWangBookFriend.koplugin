@@ -10,6 +10,17 @@ local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
 
 local Config = {}
 
+--[[--
+插件版本。全项目**只有这一处**版本号。
+
+为什么不放 `_meta.lua`、也不在任一 UI 里再写一遍：两份版本号迟早漂移——
+菜单显示 0.2、更新检查拿 0.1 去比，用户就会看到"已是最新"却怎么也拿不到新版本。
+本项目已经在别处的重复定义上吃过这个亏，这里不再给第二次机会。
+形式必须是 `数字.数字.数字`：OTA 那边按数字分段比较，
+`"0.10.0"` 与 `"0.9.0"` 用字符串比会得出错误结论。
+--]]
+Config.VERSION = "0.2.0"
+
 Config.DEFAULTS = {
     -- AI
     model = "deepseek-chat",          -- 常规任务

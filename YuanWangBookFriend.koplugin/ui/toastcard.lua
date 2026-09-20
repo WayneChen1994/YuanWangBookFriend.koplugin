@@ -37,7 +37,7 @@ end
 
 --[[--
 @param plugin 插件实例
-@param opts { selected, page_text, book_fp, progress }
+@param opts { selected, page_text, book_fp, progress, book_title }
 --]]
 function ToastCard:open(plugin, opts)
     opts = opts or {}
@@ -115,6 +115,7 @@ function ToastCard:open(plugin, opts)
                                 selected = selected_clean,
                                 page_text = opts.page_text,
                                 book_fp = opts.book_fp,
+                                book_title = opts.book_title,
                                 question = (q == "") and nil or q,
                                 -- 防剧透：进度随提交实时读取，管道在 DeepSeek:chat 出口
                                 progress = opts.progress,

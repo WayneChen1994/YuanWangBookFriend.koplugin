@@ -26,6 +26,12 @@ local T = require("ffi/util").template
 
 local Asker = {}
 
+-- 结果卡片上那个收藏按钮的 id（深聊那边也用它，所以挂在 Asker 上而不是文件私有）。
+-- ButtonTable 支持按 id 取回真正的 Button 实例（getButtonById），
+-- 于是切换收藏状态时只改按钮文字即可，不必重建整个结果页——
+-- 重建会把用户正在读的位置顶回开头（见 showResult 的用法）。
+Asker.FAVORITE_BUTTON_ID = "ywbf_favorite"
+
 --[[--
 等待类提示的统一出口（拟人化：主语是 %1，不是"AI"）。
 
@@ -206,26 +212,118 @@ function Asker:askSync(opts)
     -- 写进 Store 会污染笔记/对话导出（用户会看到一堆自己没问过的问题），
     -- 也会让"继续追问"的上下文里混进莫名其妙的 assistant 发言。
     -- 缓存照存（那是省钱的，上面那句把"截断"的排除了），历史不落。
+    local stored = nil
     if opts.book_fp and kind ~= "ideas" then
-        Store:append(opts.book_fp, { role = "assistant", content = res.content, kind = kind, selection = selected })
-        if not Util.isEmpty(opts.question) then
-            Store:append(opts.book_fp, { role = "user", content = opts.question, kind = kind, selection = selected })
-        end
+        stored = self:recordTurn(opts, res.content, prog, style)
     end
     logger.info("YWBF: ask ok, kind=", kind, " tokens=", tostring(res.usage and res.usage.total_tokens))
     -- 第五个返回值 truncated：只有真正走了请求才有意义。
     -- 缓存命中的 early return 不带它（nil = false），语义正确：
     -- 能进缓存的都是完整输出，被截断的那次我们根本没存。
-    return res.content, nil, false, (res.spoiler_hit == true), truncated
+    -- 第六个返回值 stored：这一轮**回答条目**在历史里的定位 { book_fp, index }，
+    -- 结果卡片要靠它挂收藏按钮；写不进去（例如没有 book_fp）时为 nil。
+    return res.content, nil, false, (res.spoiler_hit == true), truncated, stored
+end
+
+--[[--
+把一轮问答写进历史，并返回回答条目的定位。
+
+为什么单独摊成一个方法：askSync 有好几条出口（缓存命中 / 本地拦截 / 请求失败 / 正常），
+每条各自拼一遍 Store:append 的字段，迟早在某条分支上漏掉一个新字段
+（turn_id 漏了就配不成对，book_title 漏了列表里就只显示"未知书"）。
+字段只在**这一处**拼，出口都来调它。
+
+**同一轮的两条共用 turn_id**：列表展示时要能把"当时问的是什么"找回来，
+而 user / assistant 是两条独立记录，靠相邻位置猜不可靠。
+
+@param opts   askSync 的原始 opts（用到 book_fp / kind / selected / question / book_title）
+@param answer 回答正文
+@param prog   已经算好的进度（章节信息从这里取，**不再重算、也不发任何请求**）
+@param style  当时的回复风格 key（阶段二要做风格筛选，现在就得记下来，
+              事后再补是补不出来的——老数据不知道当时用了什么风格）
+@return table|nil { book_fp = ..., index = ... }；写失败或没有 book_fp 时为 nil
+--]]
+function Asker:recordTurn(opts, answer, prog, style)
+    opts = opts or {}
+    local book_fp = opts.book_fp
+    if not book_fp then return nil end
+
+    local turn_id = Store:newTurnId()
+    local fields = {
+        kind = opts.kind or "explain",
+        selection = opts.selected or "",
+        turn_id = turn_id,
+        book_fp = book_fp,
+        book_title = opts.book_title,
+        chapter_title = type(prog) == "table" and prog.chapter or nil,
+        chapter_index = type(prog) == "table" and prog.chapter_index or nil,
+        page = type(prog) == "table" and prog.page or nil,
+        question = opts.question,
+        style = style,
+    }
+
+    local ok_write = Store:append(book_fp, {
+        role = "assistant", content = answer or "",
+        kind = fields.kind, selection = fields.selection,
+        turn_id = turn_id, book_fp = book_fp, book_title = fields.book_title,
+        chapter_title = fields.chapter_title, chapter_index = fields.chapter_index,
+        page = fields.page, question = fields.question, style = fields.style,
+    })
+    if not ok_write then return nil end
+
+    if not Util.isEmpty(opts.question) then
+        Store:append(book_fp, {
+            role = "user", content = opts.question,
+            kind = fields.kind, selection = fields.selection,
+            turn_id = turn_id, book_fp = book_fp, book_title = fields.book_title,
+            chapter_title = fields.chapter_title, chapter_index = fields.chapter_index,
+            page = fields.page, question = fields.question, style = fields.style,
+        })
+    end
+
+    -- 写完立刻回查 index：append 的返回值只有成功与否，而现在 Button 需要精确定位。
+    -- 用 turn_id 查而不是取 #entries：万一中间夹了别的写入（并发/其它入口），
+    -- 位置会漂；id 不会。
+    local index = Store:indexOfTurn(book_fp, turn_id, "assistant")
+    if not index then return nil end
+    return { book_fp = book_fp, index = index }
+end
+
+--[[--
+回答条目的定位信息（用于结果卡片挂收藏按钮）。
+
+三种情况：
+  · 刚真的发了请求：recordTurn 已经给了 { book_fp, index }；
+  · 命中缓存：这一轮**不会再写历史**（否则同一个问题反复问会不断堆叠记录），
+    于是用回答原文把之前那条记录找回来 —— 用户看到的还是那个回答，
+    理应能收藏到同一条记录上（而不是"这次没法收藏"）；
+  · 本地拦截 / 请求失败：根本没有记录，返回 nil。
+
+@return table|nil
+--]]
+function Asker:locateStoredTurn(book_fp, answer, stored)
+    if type(stored) == "table" and stored.book_fp and type(stored.index) == "number" then
+        return stored
+    end
+    if not book_fp then return nil end
+    local index = Store:indexOfContent(book_fp, answer, "assistant")
+    if index then return { book_fp = book_fp, index = index } end
+    return nil
 end
 
 --[[--
 结果展示（墨水屏：纯文本、可滚动、无渐变）。
 
-@param question 可选。轻问/追问场景下必须带上——只显示回答不显示问题，
-用户根本不知道这段回答是针对哪个问题说的。问题显示在回答上方。
+@param title       string
+@param content     string 回答正文
+@param extra_note  string|nil 补充说明（例如"来自本地缓存"）
+@param question    string|nil 提问。轻问/追问场景下必须带上——只显示回答不显示问题，
+                   用户根本不知道这段回答是针对哪个问题说的。问题显示在回答上方。
+@param ref         table|nil { book_fp, index } 这条回答在历史里的定位。
+                   传了才挂「收藏 / 取消收藏」按钮；没传（比如这条已经不在历史里）
+                   就不要挂个点了没反应的按钮。
 --]]
-function Asker:showResult(title, content, extra_note, question)
+function Asker:showResult(title, content, extra_note, question, ref)
     local text = content or ""
     if question and question ~= "" then
         text = _("【你的问题】") .. "\n" .. question .. "\n\n———\n\n" .. text
@@ -233,9 +331,49 @@ function Asker:showResult(title, content, extra_note, question)
     if extra_note and extra_note ~= "" then
         text = text .. "\n\n———\n" .. extra_note
     end
-    local viewer = TextViewer:new{
+
+    local viewer
+    local buttons_table = nil
+    if type(ref) == "table" and ref.book_fp and type(ref.index) == "number" then
+        local favored = Store:isFavorite(ref.book_fp, ref.index)
+        buttons_table = {
+            {
+                {
+                    -- id 是给按钮 update 用的：TextViewer 的 ButtonTable 支持按 id 取到
+                    -- 真正的 Button 实例（getButtonById），收藏状态变了才能只改按钮文字，
+                    -- 不把整个结果页重建一遍（重建会丢滚动位置，用户正读到一半就跳回顶部）。
+                    id = Asker.FAVORITE_BUTTON_ID,
+                    text = favored and _("取消收藏") or _("收藏"),
+                    callback = function()
+                        local now = Store:setFavorite(ref.book_fp, ref.index,
+                            not Store:isFavorite(ref.book_fp, ref.index))
+                        if now == nil then
+                            -- 记录被别的操作删掉了：说清楚，别让用户以为收藏成功了
+                            self:notify(_("收藏没有生效：这条记录已经不在历史里了"))
+                            return
+                        end
+                        local btn = viewer and viewer.button_table
+                            and viewer.button_table:getButtonById(Asker.FAVORITE_BUTTON_ID)
+                        if btn and btn.setText then
+                            btn:setText(now and _("取消收藏") or _("收藏"))
+                        end
+                        self:notify(now and _("已收藏，可在「我的收藏」里找到") or _("已取消收藏"))
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("关闭"),
+                    callback = function() UIManager:close(viewer) end,
+                },
+            },
+        }
+    end
+
+    viewer = TextViewer:new{
         title = title or _("远望书友"),
         text = text,
+        buttons_table = buttons_table,
     }
     UIManager:show(viewer)
     return viewer
@@ -248,14 +386,17 @@ function Asker:askAndShow(opts)
     local title = opts.title or _("远望书友")
     Trapper:wrap(function()
         Trapper:info(self:thinkingText())
-        local content, err, from_cache, spoiler_hit = self:askSync(opts)
+        local content, err, from_cache, spoiler_hit, _truncated, stored = self:askSync(opts)
         if Trapper:isWrapped() then Trapper:clear() end
         if not content then
             UIManager:show(InfoMessage:new{ text = _("请求失败：") .. tostring(err) })
             return
         end
         local note = from_cache and _("（来自本地缓存，未消耗 token）") or nil
-        self:showResult(title, content, note)
+        -- 收藏按钮的前提是"这条回答在历史里有据可查"：命中缓存时不写新记录，
+        -- 于是用回答原文把之前那条找回来（locateStoredTurn），找回不来就不挂按钮。
+        local ref = self:locateStoredTurn(opts.book_fp, content, stored)
+        self:showResult(title, content, note, opts.question, ref)
         if spoiler_hit then
             self:notify(_("已按防剧透规则屏蔽后续章节内容"))
         end
@@ -272,22 +413,27 @@ function Asker:submitAsync(plugin, opts)
     self:notify(T(_("已交给%1，回复稍后送达"), Prompts.PERSONA_NAME))
 
     -- Queue:process() 只把 fn 的第一个返回值传给 on_done，
-    -- 防剧透命中标记用闭包变量带出去。
+    -- 防剧透命中标记和"这一轮存在历史里的位置"都用闭包变量带出去。
     local spoiler_hit = false
+    local stored_row = nil
 
     Queue:submit({
         name = "light_" .. (opts.kind or "ask"),
         fn = function()
             logger.info("YWBF: queue task start")
-            local content, err, from_cache, hit = self:askSync(opts)
+            local content, err, from_cache, hit, _truncated, stored = self:askSync(opts)
             logger.info("YWBF: queue task done, ok=", content ~= nil, " err=", tostring(err))
             spoiler_hit = (hit == true)
+            stored_row = stored
             if spoiler_hit then
                 self:notify(_("已按防剧透规则屏蔽后续章节内容"))
             end
             return content, err
         end,
         on_done = function(content)
+            -- ref 要在建 reply 之前算出来：reply 里要带上定位，
+            -- 否则"查看最近回复"回退到历史读出来时挂不上收藏按钮。
+            local ref = self:locateStoredTurn(opts.book_fp, content, stored_row)
             local reply = {
                 content = content,
                 kind = opts.kind or "light",
@@ -296,6 +442,10 @@ function Asker:submitAsync(plugin, opts)
                 selection = opts.selected or "",
                 question = question,      -- 必须带上：只显示回答用户不知道问的是什么
                 spoiler_hit = spoiler_hit,
+                -- 定位信息带上之后，"查看最近回复"即使是从历史回退读出来的，
+                -- 也能挂上收藏按钮（否则只有刚问完那一次能收藏，关掉书就不行了）。
+                book_fp = opts.book_fp,
+                index = ref and ref.index or nil,
             }
             plugin.last_reply = reply
             self:notify(T(_("%1回复已就绪"), Prompts.PERSONA_NAME))
@@ -306,7 +456,9 @@ function Asker:submitAsync(plugin, opts)
                 if spoiler_hit then
                     note = _("已按防剧透规则屏蔽未读内容") .. "\n" .. note
                 end
-                self:showResult(reply.title, content, note, question)
+                -- 轻问的回复同样可以收藏：用户刚刚花钱拿到的回答，
+                -- 关掉通知就找不回来了，收藏是唯一留得住它的动作
+                self:showResult(reply.title, content, note, question, ref)
             end
         end,
         on_error = function(err)

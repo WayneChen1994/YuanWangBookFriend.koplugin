@@ -1,0 +1,27 @@
+# 私钥与敏感信息
+DeepSeek_API_KEY.txt
+WEREAD_API_KEY.txt
+*API_KEY*
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+
+# 测试数据
+test_books/
+tests/testdata/
+*.log
+crash.log
+
+# 临时
+.tmp/
+# 工程师/QA 跑脚本时落在 tools/ 下的临时输出（_*.txt），不进仓库。
+# 保留文件本身：里面混着别人刚跑出来的结果，删错了比留着贵。要清空用
+#   rm -f tools/_*.txt
+tools/_*.txt
+.DS_Store
+test_out.txt
+syn.txt
+
+# WorkBuddy 工作目录（含会话记忆，不进公开仓库）
+.workbuddy/
